@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!--
+    Dead Repo Resurrector — status dashboard (REQ-7.2, REQ-7.3).
+
+    Self-contained static page: inline CSS + vanilla JS, no external CDN/build
+    step so it works offline and within a strict CSP. It fetches the read-only
+    GET /state JSON API (dashboard_lambda) and re-renders every 30 seconds.
+
+    API URL resolution (configurable at deploy time without a rebuild), first
+    match wins:
+      1. ?api=<url> query parameter
+      2. window.DASHBOARD_API_URL global (inject a small <script> at deploy)
+      3. <meta name="dashboard-api" content="<url>"> tag
+      4. relative default "/state"
+    Task 13 injects the real API Gateway invoke URL via option 2 or 3 when the
+    page is published to S3/CloudFront.
+
+    Security: every scanned value (repo name, notes, status, ...) is
+    third-party-controlled, so all cell content is written with textContent /
+    createElement — never innerHTML string interpolation — to prevent XSS. PR
+    links are only rendered when pr_url is an https URL, with
+    rel="noopener noreferrer".
+  -->
+  <meta name="dashboard-api" content="/state" />
+  <title>Resurrector — repository status</title>
+  <style>
+    :root {
+      --bg: #0f1117;
+      --panel: #171a23;
+      --border: #262b36;
+      --text: #e6e8ee;
+      --muted: #9aa3b2;
+      --link: #6ea8fe;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    }
+    header {
+      padding: 20px 24px;
+      border-bottom: 1px solid var(--border);
+    }
+    h1 { margin: 0 0 4px; font-size: 18px; }
+    .tagline { color: var(--muted); font-size: 13px; margin: 0; }
+    .meta {
+      display: flex;
+      gap: 16px;
+      align-items: center;
+      padding: 12px 24px;
+      color: var(--muted);
+      font-size: 13px;
+      flex-wrap: wrap;
+    }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); display: inline-block; }
+    .dot.ok { background: #3fb950; }
+    .dot.err { background: #f85149; }
+    .dot.loading { background: #d29922; }
+    main { padding: 0 24px 32px; }
+    table { width: 100%; border-collapse: collapse; }
+    caption { text-align: left; padding: 8px 0; color: var(--muted); }
+    th, td {
+      text-align: left;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--border);
+      vertical-align: top;
+    }
+    th { color: var(--muted); font-weight: 600; white-space: nowrap; }
+    tbody tr:hover { background: var(--panel); }
+    a { color: var(--link); }
+    .badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 600;
+      border: 1px solid var(--border);
+      white-space: nowrap;
+    }
+    .badge.discovered     { background: #1f2733; color: #9ecbff; }
+    .badge.in_progress    { background: #26210f; color: #e3b341; }
+    .badge.pr_opened      { background: #12261a; color: #56d364; }
+    .badge.success        { background: #0d2818; color: #3fb950; border-color: #238636; }
+    .badge.rejected       { background: #2b1416; color: #ff7b72; }
+    .badge.fix_failed     { background: #2b1416; color: #ff7b72; }
+    .badge.skipped_complex{ background: #241a2e; color: #d2a8ff; }
+    .badge.dormant        { background: #1c1f26; color: #9aa3b2; }
+    .badge.ignored        { background: #1c1f26; color: #6e7681; }
+    .yes { color: #3fb950; font-weight: 600; }
+    .no  { color: var(--muted); }
+    .empty { color: var(--muted); padding: 24px 0; }
+    .muted { color: var(--muted); }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Dead Repo Resurrector — status</h1>
+    <p class="tagline">Live view of repositories that appear to have reduced maintenance activity.</p>
+  </header>
+
+  <div class="meta">
+    <span><span id="status-dot" class="dot loading"></span> <span id="status-text">Loading…</span></span>
+    <span id="last-updated" class="muted"></span>
+    <span id="count" class="muted"></span>
+  </div>
+
+  <main>
+    <table aria-describedby="status-text">
+      <caption id="table-caption">Repository engagement state (auto-refreshes every 30 seconds).</caption>
+      <thead>
+        <tr>
+          <th scope="col">Repository</th>
+          <th scope="col">Status</th>
+          <th scope="col">PR</th>
+          <th scope="col">Maintainer responded</th>
+          <th scope="col">Follow-ups</th>
+          <th scope="col">Complexity</th>
+          <th scope="col">Last action</th>
+        </tr>
+      </thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <p id="empty" class="empty" hidden>No repositories tracked yet.</p>
+  </main>
+
+  <script>
+    "use strict";
+
+    // --- API URL resolution (deploy-time configurable, no rebuild) ---------
+    function resolveApiUrl() {
+      var params = new URLSearchParams(window.location.search);
+      var fromQuery = params.get("api");
+      if (fromQuery) { return fromQuery; }
+      if (window.DASHBOARD_API_URL) { return window.DASHBOARD_API_URL; }
+      var meta = document.querySelector('meta[name="dashboard-api"]');
+      if (meta && meta.getAttribute("content")) { return meta.getAttribute("content"); }
+      return "/state";
+    }
+
+    var API_URL = resolveApiUrl();
+    var REFRESH_MS = 30000; // REQ-7.3: auto-refresh every 30 seconds.
+
+    var statusDot = document.getElementById("status-dot");
+    var statusText = document.getElementById("status-text");
+    var lastUpdated = document.getElementById("last-updated");
+    var countEl = document.getElementById("count");
+    var rowsEl = document.getElementById("rows");
+    var emptyEl = document.getElementById("empty");
+
+    function setStatus(kind, text) {
+      statusDot.className = "dot " + kind;
+      statusText.textContent = text;
+    }
+
+    // Only render an <a> for a genuine https URL; otherwise show plain text.
+    function isHttpsUrl(value) {
+      if (typeof value !== "string") { return false; }
+      try {
+        var u = new URL(value);
+        return u.protocol === "https:";
+      } catch (e) {
+        return false;
+      }
+    }
+
+    function textCell(value) {
+      var td = document.createElement("td");
+      td.textContent = (value === null || value === undefined || value === "") ? "—" : String(value);
+      return td;
+    }
+
+    function statusCell(status) {
+      var td = document.createElement("td");
+      var span = document.createElement("span");
+      var safe = typeof status === "string" ? status : "unknown";
+      span.className = "badge " + safe.replace(/[^a-z_]/gi, "");
+      span.textContent = safe;
+      td.appendChild(span);
+      return td;
+    }
+
+    function prCell(prUrl, prNumber) {
+      var td = document.createElement("td");
+      if (isHttpsUrl(prUrl)) {
+        var a = document.createElement("a");
+        a.href = prUrl; // href assignment does not execute markup
+        a.rel = "noopener noreferrer";
+        a.target = "_blank";
+        a.textContent = prNumber ? ("#" + prNumber) : "view PR";
+        td.appendChild(a);
+      } else {
+        td.textContent = "—";
+      }
+      return td;
+    }
+
+    function respondedCell(responded) {
+      var td = document.createElement("td");
+      td.textContent = responded ? "yes" : "no";
+      td.className = responded ? "yes" : "no";
+      return td;
+    }
+
+    function renderRows(repos) {
+      // Clear existing rows without innerHTML.
+      while (rowsEl.firstChild) { rowsEl.removeChild(rowsEl.firstChild); }
+
+      if (!repos || repos.length === 0) {
+        emptyEl.hidden = false;
+        return;
+      }
+      emptyEl.hidden = true;
+
+      repos.forEach(function (repo) {
+        var tr = document.createElement("tr");
+        tr.appendChild(textCell(repo.repo_full_name));
+        tr.appendChild(statusCell(repo.status));
+        tr.appendChild(prCell(repo.pr_url, repo.pr_number));
+        tr.appendChild(respondedCell(repo.maintainer_responded));
+        tr.appendChild(textCell(repo.follow_up_count));
+        tr.appendChild(textCell(repo.complexity));
+        tr.appendChild(textCell(repo.last_action_at));
+        rowsEl.appendChild(tr);
+      });
+    }
+
+    function refresh() {
+      setStatus("loading", "Refreshing…");
+      fetch(API_URL, { headers: { "Accept": "application/json" } })
+        .then(function (res) {
+          if (!res.ok) { throw new Error("HTTP " + res.status); }
+          return res.json();
+        })
+        .then(function (data) {
+          renderRows(data.repos || []);
+          var n = (typeof data.count === "number") ? data.count : (data.repos || []).length;
+          countEl.textContent = n + (n === 1 ? " repository" : " repositories");
+          lastUpdated.textContent = "Updated " + new Date().toLocaleTimeString();
+          setStatus("ok", "Live");
+        })
+        .catch(function (err) {
+          setStatus("err", "Error loading state: " + err.message);
+        });
+    }
+
+    refresh();
+    setInterval(refresh, REFRESH_MS);
+  </script>
+</body>
+</html>
