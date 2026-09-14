@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!--
+      API URL resolution (deploy-time configurable, no rebuild), first match wins:
+        1. ?api=<url> query parameter
+        2. window.DASHBOARD_API_URL global (inject a <script> at deploy)
+        3. <meta name="dashboard-api" content="<url>"> tag (below)
+        4. relative default "/state"
+      Matches the resolution order of the legacy src/dashboard/index.html so the
+      existing deploy tooling (Task 13) keeps working unchanged.
+    -->
+    <meta name="dashboard-api" content="/state" />
+    <!-- Live GitHub discovery endpoint; the deploy step rewrites this to the
+         real API Gateway /live URL. Falls back to deriving it from the /state
+         URL when absent. -->
+    <meta name="dashboard-live" content="/live" />
+    <title>Resurrector — Live Operations</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

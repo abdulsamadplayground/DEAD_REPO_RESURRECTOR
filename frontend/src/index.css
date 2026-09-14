@@ -1,0 +1,109 @@
+@import "tailwindcss";
+
+/*
+  Design tokens for the Resurrector dashboard. Dark, high-contrast operations
+  console aesthetic. Tailwind v4 reads @theme tokens as first-class utilities.
+*/
+@theme {
+  --color-bg: #0a0c12;
+  --color-bg-elevated: #0f1219;
+  --color-panel: #141824;
+  --color-panel-hover: #1a1f2e;
+  --color-border: #232838;
+  --color-border-strong: #313a52;
+  --color-text: #e8ebf2;
+  --color-muted: #8a93a6;
+  --color-faint: #5b6478;
+  --color-accent: #6ea8fe;
+  --color-accent-glow: #4d7fff;
+  --color-good: #3fb950;
+  --color-warn: #e3b341;
+  --color-bad: #ff7b72;
+
+  --font-sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+    Helvetica, Arial, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  --radius-card: 16px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background:
+    radial-gradient(1200px 700px at 15% -5%, rgba(77, 127, 255, 0.10), transparent 60%),
+    radial-gradient(1000px 600px at 100% 0%, rgba(86, 211, 100, 0.06), transparent 55%),
+    var(--color-bg);
+  color: var(--color-text);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* Thin, unobtrusive scrollbars that match the theme. */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-border-strong);
+  border-radius: 8px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+@keyframes pulse-ring {
+  0% {
+    box-shadow: 0 0 0 0 rgba(63, 185, 80, 0.5);
+  }
+  70% {
+    box-shadow: 0 0 0 8px rgba(63, 185, 80, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(63, 185, 80, 0);
+  }
+}
+
+@keyframes shimmer {
+  0% {
+    background-position: -400px 0;
+  }
+  100% {
+    background-position: 400px 0;
+  }
+}
+
+.live-dot {
+  animation: pulse-ring 2s infinite;
+}
+
+.skeleton {
+  background: linear-gradient(
+    90deg,
+    var(--color-panel) 25%,
+    var(--color-panel-hover) 50%,
+    var(--color-panel) 75%
+  );
+  background-size: 800px 100%;
+  animation: shimmer 1.4s infinite linear;
+}
+
+/* Subtle glass panel used across cards. */
+.panel {
+  background: color-mix(in srgb, var(--color-panel) 92%, transparent);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-card);
+  backdrop-filter: blur(8px);
+}
