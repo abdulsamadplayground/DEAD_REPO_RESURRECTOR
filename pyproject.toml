@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dead-repo-resurrector"
+version = "0.1.0"
+description = "Autonomous multi-agent system that discovers, fixes, and follows up on abandoned GitHub repositories using the AWS Strands Agents SDK."
+readme = "README.md"
+requires-python = ">=3.12"
+# Strands is the CORE of this system, not an optional add-on: every agent
+# (Orchestrator, Analyst, Engineer, Communicator) is a `strands.Agent`. The
+# floors below are the versions the code is verified against on the project
+# `.venv` (Python 3.12.14); they are lower bounds, not exact pins, so security
+# and patch releases flow through without churning this file.
+dependencies = [
+    "strands-agents>=1.55.1",
+    "strands-agents-tools>=0.8.8",
+    "boto3",
+    "PyGithub",
+    "requests",
+]
+
+[project.optional-dependencies]
+# Test-only dependencies. `moto` is imported by tests/test_dynamo_tools.py to
+# mock DynamoDB; `pytest` is the runner. Floored at the versions installed in
+# the project `.venv` and verified green, kept as lower bounds so compatible
+# newer releases install cleanly.
+dev = [
+    "moto>=5.2.3",
+    "pytest>=9.1.1",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

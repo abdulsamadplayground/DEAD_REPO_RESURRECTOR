@@ -1,0 +1,9 @@
+# Runtime dependencies bundled into every Lambda artifact (installed by the
+# Makefile builder inside the SAM build container -> Linux wheels).
+# Pinned to the versions the project is verified against in .venv.
+strands-agents==1.55.1
+strands-agents-tools==0.8.8
+PyGithub==2.10.0
+requests==2.34.2
+google-genai==2.23.0
+boto3==1.43.93

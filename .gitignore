@@ -1,0 +1,44 @@
+# Python virtual environment (project venv lives here)
+.venv/
+venv/
+
+# Editable-install / build metadata
+*.egg-info/
+build/
+dist/
+
+# Bytecode and caches
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# AWS SAM build artifacts
+.aws-sam/
+samconfig.toml
+
+# Kiro IDE workspace (specs, steering, hooks) — not part of the shipped project
+.kiro/
+
+# Secrets / local environment — never commit real credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Node / frontend
+node_modules/
+frontend/dist/
+
+# Editors
+.idea/
+.vscode/
+
+# Sandbox demo — kept as its own separate repo for demonstrating the system
+sandbox/
+
+# macOS
+.DS_Store
