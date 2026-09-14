@@ -1,0 +1,186 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Dead Repo Resurrector - Option A demo stack. Hosts the React dashboard on
+  S3 + CloudFront and serves LIVE GitHub data via a read-only /live Lambda plus
+  the read-only /state Lambda. This is a self-contained subset of template.yaml
+  that omits the agent Lambdas (Scanner/Processor/Webhook) — which reference
+  Bedrock/Gemini/webhook secrets that are gated in this account — so the demo
+  can deploy cleanly. The full system lives in template.yaml.
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures:
+      - arm64
+    Timeout: 30
+    MemorySize: 256
+
+Parameters:
+  GitHubTokenSecretId:
+    Type: String
+    Default: /resurrector/github-token
+    Description: Secrets Manager secret id holding the fine-grained GitHub PAT.
+  StateTableName:
+    Type: String
+    Default: ResurrectorState
+    Description: >
+      Name of the existing ResurrectorState DynamoDB table. This demo stack does
+      NOT create the table (it already exists / is owned by the full
+      template.yaml stack); it only reads it. On-demand billing.
+
+Resources:
+  # /state : read-only scan of ResurrectorState -> JSON (what the agents did).
+  DashboardFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: resurrector-dashboard
+      CodeUri: .
+      Handler: src/lambdas/dashboard_lambda.lambda_handler
+      Environment:
+        Variables:
+          RESURRECTOR_STATE_TABLE: !Ref StateTableName
+      Events:
+        State:
+          Type: Api
+          Properties:
+            RestApiId: !Ref DashboardApi
+            Path: /state
+            Method: get
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Sid: StateTableScanOnly
+              Effect: Allow
+              Action:
+                - dynamodb:Scan
+              Resource: !Sub arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${StateTableName}
+
+  # /live : read-only GitHub distress-pattern search + top open issue per repo.
+  # Only AWS call is secretsmanager:GetSecretValue on the GitHub token secret.
+  LiveFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: resurrector-live
+      CodeUri: .
+      Handler: src/lambdas/live_lambda.lambda_handler
+      Timeout: 60
+      MemorySize: 512
+      Environment:
+        Variables:
+          RESURRECTOR_GITHUB_TOKEN_SECRET_ID: !Ref GitHubTokenSecretId
+          RESURRECTOR_LIVE_MAX_RESULTS: "12"
+      Events:
+        Live:
+          Type: Api
+          Properties:
+            RestApiId: !Ref DashboardApi
+            Path: /live
+            Method: get
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Sid: ReadGitHubToken
+              Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource: !Sub arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${GitHubTokenSecretId}-??????
+
+  # Explicit API with permissive CORS so the CloudFront-hosted SPA can call it.
+  DashboardApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: Prod
+      Cors:
+        AllowMethods: "'GET,OPTIONS'"
+        AllowHeaders: "'Content-Type'"
+        AllowOrigin: "'*'"
+
+  # -------- Static hosting: private S3 + CloudFront (OAC) --------
+  DashboardSiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub resurrector-dashboard-${AWS::AccountId}-${AWS::Region}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+
+  DashboardOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub resurrector-dashboard-oac-${AWS::Region}
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  DashboardDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: Dead Repo Resurrector dashboard (SPA)
+        DefaultRootObject: index.html
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: DashboardS3Origin
+            DomainName: !GetAtt DashboardSiteBucket.RegionalDomainName
+            S3OriginConfig: {}
+            OriginAccessControlId: !GetAtt DashboardOriginAccessControl.Id
+        DefaultCacheBehavior:
+          TargetOriginId: DashboardS3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+
+  DashboardSiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DashboardSiteBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFrontRead
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub arn:${AWS::Partition}:s3:::${DashboardSiteBucket}/*
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${DashboardDistribution}
+
+Outputs:
+  DashboardApiUrl:
+    Description: Public read-only GET URL for agent-pipeline state (/state).
+    Value: !Sub https://${DashboardApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/state
+  LiveApiUrl:
+    Description: Public read-only GET URL for live GitHub candidates (/live).
+    Value: !Sub https://${DashboardApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/live
+  DashboardSiteBucketName:
+    Description: S3 bucket that holds the built dashboard SPA (private, CloudFront-only).
+    Value: !Ref DashboardSiteBucket
+  DashboardDistributionId:
+    Description: CloudFront distribution id (for cache invalidation on deploy).
+    Value: !Ref DashboardDistribution
+  DashboardSiteUrl:
+    Description: Public HTTPS URL of the dashboard (CloudFront). This is the demo link.
+    Value: !Sub https://${DashboardDistribution.DomainName}

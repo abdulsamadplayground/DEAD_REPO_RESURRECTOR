@@ -1,0 +1,556 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Dead Repo Resurrector - autonomous multi-agent system that discovers, fixes, and
+  follows up on abandoned GitHub repositories.
+
+Globals:
+  Function:
+    Runtime: python3.12
+    # Build + run natively on Graviton: the Docker build host is arm64, so
+    # `sam build --use-container` pulls the arm64 build image and installs
+    # aarch64 (manylinux) wheels without x86 emulation. arm64 Lambda is also
+    # cheaper and free-tier friendly. All four functions inherit this.
+    Architectures:
+      - arm64
+    Timeout: 900
+    MemorySize: 512
+    # Model-provider selection is env-driven (src.tools.model_provider). SAM
+    # merges these Globals env vars with each function's own Environment.Variables,
+    # so they reach all four functions; they are harmless for Scanner/Dashboard,
+    # which never build a model. We deploy on Gemini because the account's Bedrock
+    # is quota/forms-gated; the Gemini API key is loaded from Secrets Manager at
+    # runtime (RESURRECTOR_GEMINI_SECRET_ID).
+    Environment:
+      Variables:
+        RESURRECTOR_MODEL_PROVIDER: gemini
+        RESURRECTOR_MODEL_ID: gemini-3.6-flash
+        RESURRECTOR_GEMINI_SECRET_ID: !Ref GeminiSecretId
+        # Pace the Analyst->Engineer boundary so the two model stages do not
+        # share one Gemini free-tier rate-limit minute (5 req/min).
+        RESURRECTOR_MODEL_PACE_SECONDS: "65"
+
+Parameters:
+  GitHubTokenSecretId:
+    Type: String
+    Default: /resurrector/github-token
+    Description: >
+      Secrets Manager secret id holding the fine-grained GitHub PAT
+      (design.md section 11).
+  WebhookSecretId:
+    Type: String
+    Default: /resurrector/webhook-secret
+    Description: >
+      Secrets Manager secret id holding the shared HMAC secret used to verify
+      GitHub webhook payloads (design.md section 11, REQ-5.1).
+  GeminiSecretId:
+    Type: String
+    Default: /resurrector/gemini-key
+    Description: >
+      Secrets Manager secret id holding the Gemini API key used by the
+      configurable model provider (src.tools.model_provider) when
+      RESURRECTOR_MODEL_PROVIDER=gemini. Loaded at runtime, never in code/env.
+  ReevaluationDays:
+    # String, not Number: Lambda environment variable values must be strings.
+    Type: String
+    Default: "30"
+    AllowedPattern: "^[0-9]+$"
+    Description: >
+      Days that must elapse before a closed/ignored repo becomes eligible for
+      re-evaluation (REQ-1.4).
+
+Resources:
+  # DynamoDB durable state, one record per repo (partition key: repo_full_name).
+  # On-demand billing keeps this within the AWS free tier.
+  ResurrectorState:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: ResurrectorState
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: repo_full_name
+          AttributeType: S
+      KeySchema:
+        - AttributeName: repo_full_name
+          KeyType: HASH
+
+  # Dead-letter queue for candidates the Processor cannot handle. Must be FIFO
+  # because the source queue is FIFO (design.md section 10).
+  CandidateDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: resurrector-candidates-dlq.fifo
+      FifoQueue: true
+      ContentBasedDeduplication: true
+      MessageRetentionPeriod: 1209600 # 14 days
+
+  # Candidate queue: FIFO (NFR: SQS FIFO, not standard). MessageGroupId is the
+  # repo full name so work for one repo is ordered while repos stay parallel
+  # (REQ-1.5). The Scanner also passes an explicit dedup id; content-based
+  # dedup is enabled as a safety net.
+  CandidateQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: resurrector-candidates.fifo
+      FifoQueue: true
+      ContentBasedDeduplication: true
+      # The Processor may run the full agent pipeline, so allow the Lambda's
+      # 15-minute ceiling plus headroom.
+      VisibilityTimeout: 1000
+      MessageRetentionPeriod: 1209600 # 14 days
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt CandidateDeadLetterQueue.Arn
+        maxReceiveCount: 3
+
+  # Scanner: CloudWatch cron every 6 hours -> search -> dedup -> enqueue.
+  ScannerFunction:
+    Type: AWS::Serverless::Function
+    # Makefile builder (Makefile at repo root): we control exactly what enters
+    # the artifact — pinned deps from requirements.txt + the src/ package — so
+    # .venv, .git, tests, sandbox, .kiro and *.egg-info are excluded.
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: resurrector-scanner
+      CodeUri: .
+      Handler: src/lambdas/scanner_lambda.lambda_handler
+      Runtime: python3.12
+      # The scan is a handful of API calls; it does not need the global ceiling.
+      Timeout: 300
+      MemorySize: 512
+      Environment:
+        Variables:
+          RESURRECTOR_STATE_TABLE: !Ref ResurrectorState
+          RESURRECTOR_CANDIDATE_QUEUE_URL: !Ref CandidateQueue
+          RESURRECTOR_REEVALUATION_DAYS: !Ref ReevaluationDays
+          RESURRECTOR_GITHUB_TOKEN_SECRET_ID: !Ref GitHubTokenSecretId
+      Events:
+        SixHourlyScan:
+          Type: Schedule
+          Properties:
+            Name: resurrector-scanner-schedule
+            Description: Distress-pattern discovery scan (REQ-1.1)
+            Schedule: rate(6 hours)
+      # Least-privilege IAM scoped to the exact table, queue, and secret
+      # (design.md section 11). No managed full-access policies.
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Sid: StateTableReadWrite
+              Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+              Resource: !GetAtt ResurrectorState.Arn
+            - Sid: EnqueueCandidates
+              Effect: Allow
+              Action:
+                - sqs:SendMessage
+              Resource: !GetAtt CandidateQueue.Arn
+            - Sid: ReadGitHubToken
+              Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource: !Sub arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${GitHubTokenSecretId}-??????
+
+  # Operator-alert topic for REQ-6.4 escalations. SES is not used; SNS is only
+  # for operator alerts (aws-constraints.md). The Processor publishes here when a
+  # follow-up escalation occurs.
+  OperatorAlerts:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: resurrector-operator-alerts
+      DisplayName: Resurrector operator alerts
+
+  # Processor: SQS FIFO candidate queue -> Orchestrator pipeline / follow-up.
+  # Timeout is the 15-minute ceiling because the Engineer runs inside the
+  # Orchestrator pipeline (aws-constraints.md: Engineer completes within 10 min).
+  ProcessorFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: resurrector-processor
+      CodeUri: .
+      Handler: src/lambdas/processor_lambda.lambda_handler
+      Runtime: python3.12
+      Timeout: 900
+      MemorySize: 1024
+      Environment:
+        Variables:
+          RESURRECTOR_STATE_TABLE: !Ref ResurrectorState
+          RESURRECTOR_CANDIDATE_QUEUE_URL: !Ref CandidateQueue
+          RESURRECTOR_SNS_TOPIC_ARN: !Ref OperatorAlerts
+          RESURRECTOR_GITHUB_TOKEN_SECRET_ID: !Ref GitHubTokenSecretId
+          RESURRECTOR_BEDROCK_REGION: !Ref AWS::Region
+      Events:
+        CandidateQueue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt CandidateQueue.Arn
+            BatchSize: 1
+            # Partial-batch-failure reporting: a single bad record is redriven
+            # (and dead-lettered after maxReceiveCount) without reprocessing the
+            # whole batch (design.md section 10).
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+      # Least-privilege IAM (design.md section 11 / aws-constraints.md
+      # resurrector-processor). Every AWS SDK call the Lambda makes has a
+      # matching statement here; no managed full-access policies.
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            # Orchestrator state writes + the Processor's diagnostic note.
+            - Sid: StateTableReadWrite
+              Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+              Resource: !GetAtt ResurrectorState.Arn
+            # Follow-up timer enqueue (REQ-6.1 / REQ-6.2).
+            - Sid: EnqueueFollowUps
+              Effect: Allow
+              Action:
+                - sqs:SendMessage
+              Resource: !GetAtt CandidateQueue.Arn
+            # SQS event source (poll + delete + attributes) on the same queue.
+            - Sid: ConsumeCandidateQueue
+              Effect: Allow
+              Action:
+                - sqs:ReceiveMessage
+                - sqs:DeleteMessage
+                - sqs:GetQueueAttributes
+              Resource: !GetAtt CandidateQueue.Arn
+            # Operator escalation alerts (REQ-6.4).
+            - Sid: PublishOperatorAlerts
+              Effect: Allow
+              Action:
+                - sns:Publish
+              Resource: !Ref OperatorAlerts
+            # Bedrock model access for the Orchestrator + sub-agents. Scoped to
+            # the Claude Sonnet inference in us-east-1 (aws-constraints.md).
+            - Sid: InvokeBedrockModel
+              Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+              Resource:
+                - !Sub arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/anthropic.claude-3-5-sonnet-*
+                - !Sub arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*claude-3-5-sonnet*
+            - Sid: ReadGitHubToken
+              Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource: !Sub arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${GitHubTokenSecretId}-??????
+            # Gemini API key for the env-selected model provider. The Processor
+            # runs the Orchestrator -> agents pipeline, which builds a model.
+            - Sid: ReadGeminiKey
+              Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource: !Sub arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${GeminiSecretId}-??????
+
+  # Webhook: API Gateway POST /webhook -> verify HMAC -> Orchestrator.handle_reply
+  # (design.md sections 6, 9, 11; REQ-5.1-5.4). The reply path may call the
+  # Communicator (which calls Bedrock) and handle_reply writes state, so this
+  # Lambda gets DynamoDB RW + Bedrock + Secrets, but NO SQS/SNS.
+  WebhookFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: resurrector-webhook
+      CodeUri: .
+      Handler: src/lambdas/webhook_lambda.lambda_handler
+      Runtime: python3.12
+      # The reply path may run the Communicator (Bedrock round-trip) to answer a
+      # maintainer question, so allow generous headroom over a plain HTTP handler.
+      Timeout: 120
+      MemorySize: 512
+      Environment:
+        Variables:
+          RESURRECTOR_STATE_TABLE: !Ref ResurrectorState
+          RESURRECTOR_WEBHOOK_SECRET_ID: !Ref WebhookSecretId
+          RESURRECTOR_GITHUB_TOKEN_SECRET_ID: !Ref GitHubTokenSecretId
+          RESURRECTOR_BEDROCK_REGION: !Ref AWS::Region
+      Events:
+        Webhook:
+          Type: Api
+          Properties:
+            Path: /webhook
+            Method: post
+      # Least-privilege IAM (design.md section 11 / aws-constraints.md
+      # resurrector-webhook): DynamoDB read/write (handle_reply state writes),
+      # bedrock:InvokeModel (the reply path), secretsmanager:GetSecretValue on
+      # BOTH the webhook secret and the GitHub token. No SQS, no SNS.
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            # handle_reply's state transitions (the only writer) run in-process.
+            - Sid: StateTableReadWrite
+              Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+                - dynamodb:Query
+              Resource: !GetAtt ResurrectorState.Arn
+            # Bedrock model access for the Communicator reply (REQ-5.3). Scoped
+            # to the Claude Sonnet inference in-region (aws-constraints.md).
+            - Sid: InvokeBedrockModel
+              Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+              Resource:
+                - !Sub arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/anthropic.claude-3-5-sonnet-*
+                - !Sub arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*claude-3-5-sonnet*
+            # HMAC webhook secret (REQ-5.1) + GitHub token for the reply path.
+            - Sid: ReadWebhookSecret
+              Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource: !Sub arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${WebhookSecretId}-??????
+            - Sid: ReadGitHubToken
+              Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource: !Sub arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${GitHubTokenSecretId}-??????
+            # Gemini API key for the env-selected model provider. The reply path
+            # may run the Communicator, which builds a model.
+            - Sid: ReadGeminiKey
+              Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource: !Sub arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${GeminiSecretId}-??????
+
+  # Dashboard: API Gateway GET /state -> scan ResurrectorState -> JSON. This is
+  # the read-only status endpoint the static S3/CloudFront page fetches every 30s
+  # (design.md sections 2 & 9; REQ-7.2, REQ-7.3). It is the tightest-scoped
+  # Lambda in the system: dynamodb:Scan on the state table ARN and NOTHING else
+  # (aws-constraints.md resurrector-dashboard). No writes, no SQS/SNS/Secrets.
+  DashboardFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: resurrector-dashboard
+      CodeUri: .
+      Handler: src/lambdas/dashboard_lambda.lambda_handler
+      Runtime: python3.12
+      # A single scan + JSON serialize; no agent pipeline, so keep it short.
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          RESURRECTOR_STATE_TABLE: !Ref ResurrectorState
+      Events:
+        State:
+          Type: Api
+          Properties:
+            Path: /state
+            Method: get
+      # Least-privilege IAM (aws-constraints.md resurrector-dashboard):
+      # dynamodb:Scan on the ResurrectorState table ARN ONLY. Read-only — no
+      # GetItem/PutItem/UpdateItem/Query, no other services.
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Sid: StateTableScanOnly
+              Effect: Allow
+              Action:
+                - dynamodb:Scan
+              Resource: !GetAtt ResurrectorState.Arn
+
+  # Live discovery: API Gateway GET /live -> distress-pattern GitHub search +
+  # top open issue per repo -> JSON in the same envelope as /state. This is the
+  # demo data source so the dashboard always shows REAL repositories with open
+  # issues, even before the agent pipeline has written any state. Read-only: it
+  # only reads GitHub via the PAT in Secrets Manager. No DynamoDB, SQS, SNS, S3,
+  # Bedrock. Its sole AWS SDK call is secretsmanager:GetSecretValue on the
+  # GitHub-token secret, so that is the ONLY IAM statement it gets
+  # (least-privilege, matching the resurrector-dashboard pattern).
+  LiveFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: resurrector-live
+      CodeUri: .
+      Handler: src/lambdas/live_lambda.lambda_handler
+      Runtime: python3.12
+      # A GitHub search + one shallow issue read per repo. Must finish inside API
+      # Gateway's hard 29s integration timeout, so more memory (=> more CPU) and a
+      # sub-29s function timeout. Results are edge-cached 120s (see live_lambda).
+      Timeout: 25
+      MemorySize: 1024
+      Environment:
+        Variables:
+          RESURRECTOR_GITHUB_TOKEN_SECRET_ID: !Ref GitHubTokenSecretId
+          RESURRECTOR_LIVE_MAX_RESULTS: "8"
+      Events:
+        Live:
+          Type: Api
+          Properties:
+            Path: /live
+            Method: get
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Sid: ReadGitHubToken
+              Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource: !Sub arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${GitHubTokenSecretId}-??????
+
+  # ---------------------------------------------------------------------------
+  # Static dashboard hosting (Option A): private S3 bucket + CloudFront with
+  # Origin Access Control. The bucket is NOT public; only CloudFront can read it
+  # via OAC. This keeps the SPA on HTTPS and within the free tier for demo
+  # traffic (aws-constraints.md: "S3 + CloudFront static dashboard hosting
+  # within free tier").
+  # ---------------------------------------------------------------------------
+  DashboardSiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub resurrector-dashboard-${AWS::AccountId}-${AWS::Region}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+
+  DashboardOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub resurrector-dashboard-oac-${AWS::Region}
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  DashboardDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: Dead Repo Resurrector dashboard (SPA)
+        DefaultRootObject: index.html
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: DashboardS3Origin
+            DomainName: !GetAtt DashboardSiteBucket.RegionalDomainName
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+            OriginAccessControlId: !GetAtt DashboardOriginAccessControl.Id
+        DefaultCacheBehavior:
+          TargetOriginId: DashboardS3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          Compress: true
+          # AWS managed "CachingOptimized" policy id (static assets).
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+        # SPA fallback: any missing path returns index.html so client routing
+        # and deep links work.
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+
+  # Bucket policy: allow ONLY this CloudFront distribution (via OAC) to read
+  # objects. No public access.
+  DashboardSiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DashboardSiteBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFrontRead
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub arn:${AWS::Partition}:s3:::${DashboardSiteBucket}/*
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${DashboardDistribution}
+
+Outputs:
+  ResurrectorStateTableName:
+    Description: Name of the DynamoDB state table
+    Value: !Ref ResurrectorState
+    Export:
+      Name: ResurrectorStateTableName
+  CandidateQueueUrl:
+    Description: URL of the candidate FIFO queue
+    Value: !Ref CandidateQueue
+    Export:
+      Name: ResurrectorCandidateQueueUrl
+  CandidateQueueArn:
+    Description: ARN of the candidate FIFO queue
+    Value: !GetAtt CandidateQueue.Arn
+    Export:
+      Name: ResurrectorCandidateQueueArn
+  CandidateDeadLetterQueueUrl:
+    Description: URL of the candidate dead-letter FIFO queue
+    Value: !Ref CandidateDeadLetterQueue
+    Export:
+      Name: ResurrectorCandidateDlqUrl
+  CandidateDeadLetterQueueArn:
+    Description: ARN of the candidate dead-letter FIFO queue
+    Value: !GetAtt CandidateDeadLetterQueue.Arn
+    Export:
+      Name: ResurrectorCandidateDlqArn
+  ScannerFunctionArn:
+    Description: ARN of the Scanner Lambda
+    Value: !GetAtt ScannerFunction.Arn
+  ProcessorFunctionArn:
+    Description: ARN of the Processor Lambda
+    Value: !GetAtt ProcessorFunction.Arn
+  WebhookFunctionArn:
+    Description: ARN of the Webhook Lambda
+    Value: !GetAtt WebhookFunction.Arn
+  WebhookApiUrl:
+    Description: Public URL GitHub should POST webhook events to (REQ-5.1)
+    Value: !Sub https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/webhook
+  DashboardFunctionArn:
+    Description: ARN of the Dashboard Lambda
+    Value: !GetAtt DashboardFunction.Arn
+  DashboardApiUrl:
+    Description: >
+      Public read-only GET URL the dashboard page fetches for state (REQ-7.2,
+      REQ-7.3). Inject this into index.html at deploy time (Task 13) via
+      window.DASHBOARD_API_URL, the dashboard-api meta tag, or a ?api= param.
+    Value: !Sub https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/state
+  OperatorAlertsTopicArn:
+    Description: ARN of the operator-alert SNS topic (REQ-6.4)
+    Value: !Ref OperatorAlerts
+    Export:
+      Name: ResurrectorOperatorAlertsTopicArn
+  LiveFunctionArn:
+    Description: ARN of the live-discovery Lambda
+    Value: !GetAtt LiveFunction.Arn
+  LiveApiUrl:
+    Description: >
+      Public read-only GET URL that returns REAL GitHub distress-pattern
+      candidates with their top open issue. This is the live data source the
+      demo dashboard reads.
+    Value: !Sub https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/live
+  DashboardSiteBucketName:
+    Description: S3 bucket that holds the built dashboard SPA (private, CloudFront-only)
+    Value: !Ref DashboardSiteBucket
+  DashboardDistributionId:
+    Description: CloudFront distribution id (used for cache invalidation on deploy)
+    Value: !Ref DashboardDistribution
+  DashboardSiteUrl:
+    Description: >
+      Public HTTPS URL of the dashboard (CloudFront). This is the demo link.
+    Value: !Sub https://${DashboardDistribution.DomainName}
